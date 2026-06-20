@@ -3,8 +3,8 @@
   "name": "Session Log",
   "api_version": 1,
   "permissions": [
-    "connections",
     "ui",
-    "settings"
+    "settings",
+    "filesystem"
   ]
 }

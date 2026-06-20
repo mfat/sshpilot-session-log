@@ -6,9 +6,11 @@ incident timelines.
 
 Capabilities exercised (all from ``sshpilot.plugins.api``):
 * reacting to ``SESSION_OPENED`` / ``SESSION_CLOSED`` (``ctx.events``)
-* enumerating saved hosts (``ctx.list_connections`` — needs app API >= 1.4)
 * per-plugin persisted settings (``ctx.settings``)
 * a UI page (``ctx.ui.register_page``) and toasts (``ctx.ui.notify``)
+
+Uses only the API-1 event/settings/UI surface, so it works on any sshPilot
+build (no ``list_connections``/1.4 dependency).
 
 Pure logic (``SessionLogStore``) has no GTK import and is unit-tested without
 a display; ``gi`` is imported lazily inside the page factory.
@@ -193,7 +195,9 @@ class SessionLogStore:
 class Plugin(SshPilotPlugin):
     def activate(self, ctx: PluginContext) -> None:
         self.ctx = ctx
-        self._store = SessionLogStore(ctx.settings.get("log", {}))
+        self._max_entries = self._read_max_entries()
+        self._store = SessionLogStore(ctx.settings.get("log", {}),
+                                      max_entries=self._max_entries)
         self._list_box = None
         self._filter_entry = None
         self._status_label = None
@@ -205,6 +209,12 @@ class Plugin(SshPilotPlugin):
 
     def deactivate(self) -> None:
         logger.info("session-log: deactivate")
+
+    def _read_max_entries(self) -> int:
+        try:
+            return max(1, int(self.ctx.settings.get("max_entries", MAX_ENTRIES)))
+        except (TypeError, ValueError):
+            return MAX_ENTRIES
 
     def _persist(self) -> None:
         self.ctx.settings.set("log", self._store.as_dict())
@@ -262,8 +272,18 @@ class Plugin(SshPilotPlugin):
 
         filter_group = Adw.PreferencesGroup(title="Filter")
         self._filter_entry = Adw.EntryRow(title="Nickname or host contains…")
+        self._filter_entry.set_text(self.ctx.settings.get("filter", "") or "")
         self._filter_entry.connect("changed", self._on_filter_changed)
         filter_group.add(self._filter_entry)
+        self._max_entry = Adw.EntryRow(title="Keep last N sessions")
+        self._max_entry.set_text(str(self._max_entries))
+        self._max_entry.connect("apply", self._on_max_changed)
+        self._max_entry.connect("entry-activated", self._on_max_changed)
+        try:
+            self._max_entry.set_show_apply_button(True)
+        except Exception:
+            pass
+        filter_group.add(self._max_entry)
         box.append(filter_group)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -313,7 +333,23 @@ class Plugin(SshPilotPlugin):
         return self._store.filter_entries(nickname=query, host=query)
 
     def _on_filter_changed(self, *_args) -> None:
+        self.ctx.settings.set("filter", self._filter_entry.get_text().strip())
         self._refresh_list()
+
+    def _on_max_changed(self, *_args) -> None:
+        try:
+            value = max(1, int(self._max_entry.get_text().strip()))
+        except (TypeError, ValueError):
+            self._set_status("Keep-last must be a whole number.")
+            self._max_entry.set_text(str(self._max_entries))
+            return
+        self._max_entries = value
+        self.ctx.settings.set("max_entries", value)
+        # Re-cap the existing log to the new size.
+        self._store = SessionLogStore(self._store.as_dict(), max_entries=value)
+        self._persist()
+        self._refresh_list()
+        self._set_status(f"Keeping the last {value} sessions.")
 
     def _refresh_list(self) -> None:
         if self._list_box is None:
@@ -362,21 +398,18 @@ class Plugin(SshPilotPlugin):
 
     def _on_export_clicked(self, _btn) -> None:
         csv_text = self._store.export_csv(self._filtered_entries())
-        self._copy_or_save_csv(csv_text)
+        self._export_csv(csv_text)
 
-    def _copy_or_save_csv(self, csv_text: str) -> None:
+    def _export_csv(self, csv_text: str) -> None:
+        """Save the log to a CSV file via a save dialog. Falls back to the
+        clipboard only when there's no display (headless)."""
         import gi
         gi.require_version("Gdk", "4.0")
         gi.require_version("Gtk", "4.0")
         from gi.repository import Gdk, Gtk
 
-        display = Gdk.Display.get_default()
-        if display is not None:
-            clipboard = display.get_clipboard()
-            clipboard.set(csv_text)
-            self._set_status("CSV copied to clipboard.")
-            self.ctx.ui.notify("Session log exported to clipboard")
-            return
+        if Gdk.Display.get_default() is None:
+            return self._copy_to_clipboard(csv_text)
 
         dialog = Gtk.FileDialog(title="Save session log")
         dialog.set_initial_name("sshpilot-session-log.csv")
@@ -388,18 +421,55 @@ class Plugin(SshPilotPlugin):
             try:
                 file = dlg.save_finish(result)
             except GLib.Error:
-                return
+                return  # user cancelled
             path = file.get_path()
-            if path:
+            if not path:
+                return
+            try:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(csv_text)
-                self._set_status(f"Saved to {path}")
-                self.ctx.ui.notify("Session log saved")
+            except OSError as exc:
+                self._set_status(f"Could not save: {exc}")
+                self.ctx.ui.notify("Session log export failed")
+                return
+            self._set_status(f"Saved to {path}")
+            self.ctx.ui.notify("Session log saved")
 
         dialog.save(None, None, on_save)
 
-    def _on_clear_clicked(self, _btn) -> None:
-        self._store = SessionLogStore()
+    def _copy_to_clipboard(self, csv_text: str) -> None:
+        import gi
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        display.get_clipboard().set(csv_text)
+        self._set_status("CSV copied to clipboard.")
+        self.ctx.ui.notify("Session log copied to clipboard")
+
+    def _on_clear_clicked(self, button) -> None:
+        import gi
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw
+
+        dialog = Adw.MessageDialog(
+            transient_for=button.get_root(),
+            heading="Clear session log?",
+            body="This permanently deletes the recorded session history.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("clear", "Clear")
+        dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self._on_clear_response)
+        dialog.present()
+
+    def _on_clear_response(self, _dialog, response: str) -> None:
+        if response != "clear":
+            return
+        self._store = SessionLogStore(max_entries=self._max_entries)
         self._persist()
         self._refresh_list()
         self._set_status("Log cleared.")

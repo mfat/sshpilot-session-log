@@ -6,8 +6,8 @@ incident timelines.
 
 ## Requirements
 
-- sshPilot with plugin **API ≥ 1.4** (provides `ctx.list_connections()` for
-  display context).
+- Any sshPilot with the plugin system — it uses only the API-1
+  event/settings/UI surface (no `list_connections`/1.4 dependency).
 
 ## Install
 
@@ -21,8 +21,9 @@ Or install the released `.zip` from **Preferences ▸ Plugins ▸ Install plugin
 
 ## Permissions
 
-`connections`, `ui`, `settings` — declared for transparency; sshPilot plugins
-run unsandboxed with full app privileges. Only install plugins you trust.
+`ui`, `settings`, `filesystem` (CSV export writes a file you choose) — declared
+for transparency; sshPilot plugins run unsandboxed with full app privileges.
+Only install plugins you trust.
 
 ## Develop / test
 
